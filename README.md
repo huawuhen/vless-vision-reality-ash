@@ -44,6 +44,14 @@ bash reality_neighbor.sh --scan
 sudo bash reality_neighbor.sh --domain example.com --port 443
 ```
 
+### 4. 一键彻底卸载
+
+```bash
+sudo bash reality_neighbor.sh --uninstall
+# 非交互式直接卸载（跳过确认提示）
+sudo bash reality_neighbor.sh --uninstall --yes
+```
+
 ---
 
 ## 命令行参数
@@ -54,6 +62,8 @@ sudo bash reality_neighbor.sh --domain example.com --port 443
 | `--domain`, `-d <域名>` | 跳过自动扫描，直接使用指定域名部署 Reality | 自动扫描最优 |
 | `--port`, `-p <端口>` | 指定 Xray 监听端口 | `443` |
 | `--max`, `-m <数量>` | 最大并发检测候选域名数量 | `80` |
+| `--uninstall`, `-u` | 彻底卸载 Xray、systemd 覆盖配置、对应防火墙规则及节点信息文件 | 关闭 |
+| `--yes`, `-y` | 配合 `--uninstall` 使用，跳过交互确认提示 | 关闭 |
 | `--help`, `-h` | 查看帮助信息 | - |
 
 ---

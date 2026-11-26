@@ -19,6 +19,7 @@
 #   bash reality_neighbor.sh            # 全自动扫描最优邻居域名并一键部署 Reality
 #   bash reality_neighbor.sh --scan     # 仅扫描并列出同网段/ASN 可用邻居域名及延迟排名 (不安装 Xray)
 #   bash reality_neighbor.sh --domain <域名> [--port 443] # 指定伪装域名直接部署
+#   bash reality_neighbor.sh --uninstall [-y]             # 彻底卸载 Xray 及本脚本生成的配置与节点信息
 # ==============================================================================
 
 set -euo pipefail
@@ -38,8 +39,11 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_err()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
 SCAN_ONLY=0
+UNINSTALL=0
+ASSUME_YES=0
 CUSTOM_DOMAIN=""
 LISTEN_PORT=443
+PORT_SPECIFIED=0
 MAX_TEST_CANDIDATES=80
 
 while [[ $# -gt 0 ]]; do
@@ -48,12 +52,21 @@ while [[ $# -gt 0 ]]; do
       SCAN_ONLY=1
       shift
       ;;
+    --uninstall|-u)
+      UNINSTALL=1
+      shift
+      ;;
+    --yes|-y)
+      ASSUME_YES=1
+      shift
+      ;;
     --domain|-d)
       CUSTOM_DOMAIN="${2:-}"
       shift 2
       ;;
     --port|-p)
       LISTEN_PORT="${2:-443}"
+      PORT_SPECIFIED=1
       shift 2
       ;;
     --max|-m)
@@ -67,6 +80,8 @@ while [[ $# -gt 0 ]]; do
       echo "  --domain, -d <domain>  跳过扫描，直接使用指定的邻居域名部署 VLESS+Vision+Reality"
       echo "  --port, -p <port>      指定 Xray 监听端口 (默认: 443，推荐 443)"
       echo "  --max, -m <num>        最大并发检测候选域名数量 (默认: 80)"
+      echo "  --uninstall, -u        彻底卸载 Xray、systemd 覆盖配置、防火墙规则及节点信息文件"
+      echo "  --yes, -y              配合 --uninstall 使用，跳过交互确认直接卸载"
       exit 0
       ;;
     *)
@@ -743,12 +758,110 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
+# 4. 卸载 Xray 及本脚本生成的所有配置与文件
+# ------------------------------------------------------------------------------
+uninstall_xray_reality() {
+  if [[ $EUID -ne 0 ]]; then
+    log_err "卸载 Xray 需要 root 权限，请使用 sudo bash $0 --uninstall 或切换至 root 用户运行！"
+    exit 1
+  fi
+
+  local info_file="/root/vless_reality_neighbor_info.txt"
+  local xray_cfg="/usr/local/etc/xray/config.json"
+  local detected_port=""
+
+  # 尝试在删除配置前识别当前 Xray 监听端口，用于清理对应防火墙放行规则
+  if [[ $PORT_SPECIFIED -eq 1 ]]; then
+    detected_port="$LISTEN_PORT"
+  elif [[ -f "$xray_cfg" ]]; then
+    detected_port="$(grep -oE '"port"[[:space:]]*:[[:space:]]*[0-9]+' "$xray_cfg" 2>/dev/null | head -n1 | grep -oE '[0-9]+' || true)"
+  elif [[ -f "$info_file" ]]; then
+    detected_port="$(grep -E '^端口 \(Port\)' "$info_file" 2>/dev/null | awk -F':' '{print $2}' | tr -d ' \r\n' || true)"
+  fi
+
+  echo -e "${YELLOW}${BOLD}即将执行以下卸载清理操作：${NC}"
+  echo "  1. 停止并禁用 systemd 服务 (xray)"
+  echo "  2. 卸载 Xray 程序、配置与日志 (/usr/local/bin/xray, /usr/local/etc/xray, /usr/local/share/xray, /var/log/xray)"
+  echo "  3. 删除本脚本写入的 systemd 覆盖配置 (/etc/systemd/system/xray.service.d/10-root-bind.conf)"
+  echo "  4. 删除保存的节点信息文件 (${info_file}) 及临时扫描缓存"
+  if [[ -n "$detected_port" ]]; then
+    echo "  5. 移除防火墙放行端口规则 (${detected_port}/tcp，若 ufw / firewalld 已启用)"
+  fi
+  echo -e "  ${CYAN}* 注: 系统基础依赖包与 /etc/sysctl.conf 中的 BBR 内核优化将予以保留。${NC}"
+  echo ""
+
+  if [[ $ASSUME_YES -eq 0 ]]; then
+    local confirm=""
+    if [[ -t 0 ]]; then
+      read -r -p "确定要继续卸载吗？[y/N]: " confirm || true
+    elif [[ -r /dev/tty ]]; then
+      read -r -p "确定要继续卸载吗？[y/N]: " confirm </dev/tty || true
+    else
+      log_err "当前处于非交互终端，请追加 --yes (-y) 参数以确认卸载。"
+      exit 1
+    fi
+
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      log_info "已取消卸载操作。"
+      exit 0
+    fi
+  fi
+
+  log_info "正在停止并禁用 Xray 服务..."
+  systemctl stop xray >/dev/null 2>&1 || true
+  systemctl disable xray >/dev/null 2>&1 || true
+
+  # 优先尝试调用官方 Xray-install 卸载脚本 (失败则自动回退到本地彻底清理)
+  if command -v curl >/dev/null 2>&1; then
+    log_info "正在调用官方 XTLS/Xray-install 卸载 Xray..."
+    local remove_script=""
+    remove_script="$(curl -L -s --connect-timeout 8 --max-time 20 https://github.com/XTLS/Xray-install/raw/main/install-release.sh 2>/dev/null || true)"
+    if [[ -n "$remove_script" ]]; then
+      bash -c "$remove_script" @ remove --purge >/dev/null 2>&1 || true
+    else
+      log_warn "无法连接 GitHub 获取官方卸载脚本，将直接使用本地清理模式。"
+    fi
+  fi
+
+  log_info "正在清理 Xray 二进制、配置、systemd 覆盖文件及残留目录..."
+  rm -f /etc/systemd/system/xray.service.d/10-root-bind.conf
+  rmdir /etc/systemd/system/xray.service.d 2>/dev/null || true
+  rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service
+  rm -f /usr/local/bin/xray
+  rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray
+  rm -f "$info_file"
+  rm -f /tmp/reality_best_domain_*.json /tmp/reality_best_domain.json
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl reset-failed xray >/dev/null 2>&1 || true
+
+  if [[ -n "$detected_port" ]]; then
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+      log_info "正在从 ufw 移除端口放行规则 (${detected_port}/tcp)..."
+      ufw delete allow "${detected_port}/tcp" >/dev/null 2>&1 || true
+    elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+      log_info "正在从 firewalld 移除端口放行规则 (${detected_port}/tcp)..."
+      firewall-cmd --permanent --remove-port="${detected_port}/tcp" >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+  fi
+
+  echo ""
+  log_ok "卸载完成！Xray 及本脚本生成的所有配置与节点信息文件已彻底清理。"
+}
+
+# ------------------------------------------------------------------------------
 # 主流程
 # ------------------------------------------------------------------------------
 main() {
   echo -e "${BOLD}${BLUE}================================================================================${NC}"
   echo -e "${BOLD}${BLUE}   VLESS + Vision + Reality 同网段/ASN 邻居伪装域名自动筛选与一键部署工具      ${NC}"
   echo -e "${BOLD}${BLUE}================================================================================${NC}"
+
+  if [[ $UNINSTALL -eq 1 ]]; then
+    uninstall_xray_reality
+    exit 0
+  fi
 
   install_base_deps
 
