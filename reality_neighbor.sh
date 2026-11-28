@@ -139,7 +139,7 @@ install_base_deps() {
 # ------------------------------------------------------------------------------
 scan_best_neighbor_domain() {
   local result_file="$1"
-  python3 - "$MAX_TEST_CANDIDATES" "$result_file" <<'PYEOF'
+  python3 - "$MAX_TEST_CANDIDATES" "$result_file" "$SCAN_ONLY" <<'PYEOF'
 import sys
 import re
 import json
@@ -154,6 +154,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 MAX_CANDIDATES = int(sys.argv[1]) if len(sys.argv) > 1 else 80
 RESULT_FILE = sys.argv[2] if len(sys.argv) > 2 else "/tmp/reality_best_domain.json"
+SCAN_ONLY = (len(sys.argv) > 3 and sys.argv[3] == "1")
 
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
@@ -169,6 +170,18 @@ def http_get(url, timeout=10):
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json, text/html, */*"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="ignore")
+
+def input_prompt(prompt):
+    """从 /dev/tty 读取一行交互输入。
+
+    脚本主体通过 heredoc 由 stdin 传入 (python3 -)，stdin 在脚本开始执行时已到 EOF，
+    因此 input() 会直接抛 EOFError。这里显式读取控制终端；无 TTY 时抛 OSError，
+    由调用方回退到默认的最优域名。
+    """
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    with open("/dev/tty", "r") as tty:
+        return tty.readline()
 
 def get_public_ipv4():
     endpoints = [
@@ -498,6 +511,30 @@ def main():
             f"{str(item['latency_ms']) + ' ms':<12} TLSv1.3 | ALPN: h2 | HTTP/2 200{endc}"
         )
     print("  " + "-" * 86)
+
+    # 交互式选择要部署的伪装域名 (仅非 --scan 模式；无 TTY / 非法输入时回退到延迟最低的最优域名)
+    selected_idx = 0
+    if not SCAN_ONLY:
+        show_n = min(len(valid_results), 10)
+        print("")
+        print("  请选择要使用的伪装域名 (直接回车 = 默认选 1，即延迟最低):")
+        for idx, item in enumerate(valid_results[:show_n], 1):
+            print(f"    [{idx}] {item['domain']:<32} {item['ip']:<15} {item['latency_ms']} ms")
+        while True:
+            try:
+                raw = input_prompt(f"  请输入序号 [1-{show_n}]，默认 1: ")
+            except Exception:
+                selected_idx = 0
+                break
+            raw = raw.strip()
+            if raw == "":
+                selected_idx = 0
+                break
+            if raw.isdigit() and 1 <= int(raw) <= show_n:
+                selected_idx = int(raw) - 1
+                break
+            print(f"  \033[1;33m输入无效，请输入 1-{show_n} 之间的数字。\033[0m")
+        best = valid_results[selected_idx]
 
     output_payload = {
         "my_ip": my_ip,
